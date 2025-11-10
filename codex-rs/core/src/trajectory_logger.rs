@@ -243,16 +243,6 @@ impl TrajectoryRecorder {
         }
     }
 
-    pub(crate) async fn record_error(&self, error: String) {
-        {
-            let mut state = self.state.lock().await;
-            if state.error.is_none() {
-                state.error = Some(error);
-            }
-        }
-        self.finish().await;
-    }
-
     pub(crate) async fn finish(&self) {
         let (interaction, path, provider, model) = {
             let mut state = self.state.lock().await;
@@ -441,6 +431,19 @@ fn wire_api_label(wire_api: WireApi) -> &'static str {
     }
 }
 
+const MAX_LOG_CHARS: usize = 4000;
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { return s.to_string(); }
+    let mut out = s[..max].to_string();
+    out.push_str("…[truncated]");
+    out
+}
+
+fn to_compact_json(v: &serde_json::Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "<json-serialize-error>".to_string())
+}
+
 fn build_logged_messages(
     instructions: String,
     input: &[ResponseItem],
@@ -456,31 +459,127 @@ fn build_logged_messages(
         match item {
             ResponseItem::Message { role, content, .. } => {
                 if let Some(text) = content_items_to_text(content) {
-                    messages.push(LoggedMessage {
-                        role: role.clone(),
-                        content: text.clone(),
-                    });
-                    if role == "user" && !text.trim().is_empty() {
-                        last_user = Some(text);
+                    let txt = text.trim();
+                    if !txt.is_empty() {
+                        messages.push(LoggedMessage {
+                            role: role.clone(),
+                            content: truncate(txt, MAX_LOG_CHARS),
+                        });
+                        if role == "user" {
+                            last_user = Some(txt.to_string());
+                        }
                     }
                 }
             }
-            ResponseItem::Reasoning {
-                summary, content, ..
-            } => {
+
+            ResponseItem::Reasoning { summary, content, .. } => {
                 if let Some(text) = reasoning_to_text(summary, content) {
-                    messages.push(LoggedMessage {
-                        role: "assistant_reasoning".to_string(),
-                        content: text,
-                    });
+                    let txt = text.trim();
+                    if !txt.is_empty() {
+                        messages.push(LoggedMessage {
+                            role: "reasoning".to_string(),
+                            content: truncate(txt, MAX_LOG_CHARS),
+                        });
+                    }
                 }
             }
-            _ => {}
+
+            ResponseItem::LocalShellCall { status, action, .. } => {
+                let v = serde_json::json!({
+                    "type": "local_shell_call",
+                    "status": status,
+                    "action": action,
+                });
+                messages.push(LoggedMessage {
+                    role: "local_shell_call".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
+
+            ResponseItem::FunctionCall { name, arguments, call_id, .. } => {
+                let args_json: serde_json::Value = serde_json::from_str(arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()));
+                let v = serde_json::json!({
+                    "type": "function_call",
+                    "name": name,
+                    "call_id": call_id,
+                    "arguments": args_json,
+                });
+                messages.push(LoggedMessage {
+                    role: "function_call".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
+
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let v = serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                });
+                messages.push(LoggedMessage {
+                    role: "function_call_output".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
+
+            ResponseItem::CustomToolCall { status, call_id, name, input, .. } => {
+                let parsed_input: serde_json::Value = serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::Value::String(input.clone()));
+                let v = serde_json::json!({
+                    "type": "custom_tool_call",
+                    "status": status,
+                    "call_id": call_id,
+                    "name": name,
+                    "input": parsed_input,
+                });
+                messages.push(LoggedMessage {
+                    role: "custom_tool_call".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
+
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                let parsed_output: serde_json::Value = serde_json::from_str(output)
+                    .unwrap_or_else(|_| serde_json::Value::String(output.clone()));
+                let v = serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": parsed_output,
+                });
+                messages.push(LoggedMessage {
+                    role: "custom_tool_call_output".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
+
+            ResponseItem::WebSearchCall { status, action, .. } => {
+                let v = serde_json::json!({
+                    "type": "web_search_call",
+                    "status": status,
+                    "action": action,
+                });
+                messages.push(LoggedMessage {
+                    role: "web_search_call".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
+
+            ResponseItem::Other => {
+                let v = serde_json::json!({
+                    "type": "other_input_item"
+                });
+                messages.push(LoggedMessage {
+                    role: "tool_output".to_string(),
+                    content: truncate(&to_compact_json(&v), MAX_LOG_CHARS),
+                });
+            }
         }
     }
 
     (messages, last_user)
 }
+
 
 fn reasoning_to_text(
     summary: &[ReasoningItemReasoningSummary],
