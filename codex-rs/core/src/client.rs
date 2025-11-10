@@ -55,6 +55,8 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
 
+use crate::trajectory_logger::TrajectoryRecorder;
+
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     error: Error,
@@ -81,6 +83,7 @@ pub struct ModelClient {
     conversation_id: ConversationId,
     effort: Option<ReasoningEffortConfig>,
     summary: ReasoningSummaryConfig,
+    trajectory_recorder: Option<Arc<TrajectoryRecorder>>,
 }
 
 impl ModelClient {
@@ -94,6 +97,16 @@ impl ModelClient {
         conversation_id: ConversationId,
     ) -> Self {
         let client = create_client();
+        let model_for_log = config.model.clone();
+
+        let trajectory_recorder = TrajectoryRecorder::new(
+            &provider,
+            &model_for_log,
+            &config.model_family,
+            &conversation_id,
+            None,
+            None,
+        );
 
         Self {
             config,
@@ -104,6 +117,7 @@ impl ModelClient {
             conversation_id,
             effort,
             summary,
+            trajectory_recorder,
         }
     }
 
@@ -123,8 +137,18 @@ impl ModelClient {
     /// the provider config.  Public callers always invoke `stream()` – the
     /// specialised helpers are private to avoid accidental misuse.
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        if let Some(rec) = &self.trajectory_recorder {
+            rec.start_new_interaction(&self.config.model_family, &self.conversation_id, Some(prompt)).await;
+        }
         match self.provider.wire_api {
-            WireApi::Responses => self.stream_responses(prompt).await,
+            WireApi::Responses => {
+                let raw = self.stream_responses(prompt).await?;
+                let ResponseStream { rx_event } = raw;
+                if let Some(rec) = &self.trajectory_recorder {
+                    return Ok(TrajectoryRecorder::wrap(rec.clone(), rx_event));
+                }
+                Ok(ResponseStream { rx_event })
+            }
             WireApi::Chat => {
                 // Create the raw streaming connection first.
                 let response_stream = stream_chat_completions(
@@ -158,7 +182,9 @@ impl ModelClient {
                         }
                     }
                 });
-
+                if let Some(rec) = &self.trajectory_recorder {
+                    return Ok(TrajectoryRecorder::wrap(rec.clone(), rx));
+                }
                 Ok(ResponseStream { rx_event: rx })
             }
         }
